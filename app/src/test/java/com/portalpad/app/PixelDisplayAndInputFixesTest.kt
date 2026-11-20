@@ -102,4 +102,62 @@ class PixelDisplayAndInputFixesTest {
         assertEquals(412f, fallbackX, 0.01f)
         assertEquals(289f, fallbackY, 0.01f)
     }
+
+    @Test
+    fun computeScrollSwipePlan_preservesScrollAtTopAndBottomScreenEdges() {
+        // Cursor parked at the very top edge (y = 0): scrolling down produces a
+        // negative swipe delta (finger swiping up) that must NOT be discarded.
+        val topPlan = InputInjector.computeScrollSwipePlan(
+            cursorX = 960f,
+            cursorY = 0f,
+            rawDeltaX = 0f,
+            rawDeltaY = -48f,
+            displayWidth = 1920,
+            displayHeight = 1080,
+            minTravel = 24.0,
+        )!!
+        assertEquals(-48f, topPlan.pageScrollDeltaY, 0.01f)
+        assertEquals(0f, topPlan.endY, 0.01f)
+        assertEquals(48f, topPlan.startY, 0.01f)
+
+        // Cursor parked on the bottom dock (y = 1079): scrolling up produces a
+        // positive swipe delta (finger swiping down) that must retain full travel.
+        val bottomPlan = InputInjector.computeScrollSwipePlan(
+            cursorX = 960f,
+            cursorY = 1079f,
+            rawDeltaX = 0f,
+            rawDeltaY = 48f,
+            displayWidth = 1920,
+            displayHeight = 1080,
+            minTravel = 24.0,
+        )!!
+        assertEquals(48f, bottomPlan.pageScrollDeltaY, 0.01f)
+        assertEquals(1079f, bottomPlan.endY, 0.01f)
+        assertEquals(1031f, bottomPlan.startY, 0.01f)
+    }
+
+    @Test
+    fun dockScrollHideTracker_hidesOnScrollDownAndRestoresOnScrollUp() {
+        val tracker = com.portalpad.app.ui.dock.DockScrollHideTracker()
+        assertFalse(tracker.isHidden)
+
+        // Sub-threshold jitter keeps dock visible.
+        assertFalse(tracker.onPageScroll(-10f, enabled = true))
+        // Crossing -24px hides dock.
+        assertTrue(tracker.onPageScroll(-16f, enabled = true))
+        // Scrolling back up (+16px) restores dock.
+        assertTrue(tracker.onPageScroll(8f, enabled = true))
+        assertFalse(tracker.onPageScroll(10f, enabled = true))
+
+        // Disabled toggle resets and leaves dock visible.
+        assertTrue(tracker.onPageScroll(-40f, enabled = true))
+        assertFalse(tracker.onPageScroll(-40f, enabled = false))
+    }
+
+    @Test
+    fun dockConfig_defaultsHideOnScrollToTrueWhenMissingFromLegacyJson() {
+        val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+        val legacy = json.decodeFromString<com.portalpad.app.data.DockConfig>("{}")
+        assertTrue(legacy.hideOnScroll)
+    }
 }

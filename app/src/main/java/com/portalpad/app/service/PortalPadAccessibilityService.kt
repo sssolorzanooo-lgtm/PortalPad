@@ -116,6 +116,8 @@ class PortalPadAccessibilityService : AccessibilityService() {
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val probeToken = Any()
     private val readerFindToken = Any()
+    private val lastScrollStateByWindow =
+        java.util.concurrent.ConcurrentHashMap<String, Pair<Int, Int>>()
     // Live reference to the last tapped editable field on the glasses. The relay
     // uses it to DELETE via ACTION_SET_TEXT (no DEL key → no focus bounce → no IME
     // cursor desync, which is why keystroke-DEL could only delete once on a field
@@ -239,6 +241,56 @@ class PortalPadAccessibilityService : AccessibilityService() {
         }.onFailure { Log.w(TAG, "CD-DIALOG probe failed", it) }
     }
 
+    private fun handleViewScrolledForDock(event: AccessibilityEvent) {
+        val app = applicationContext as? PortalPadApp ?: return
+        val extId = app.externalDisplayId.value ?: return
+        val pkg = event.packageName?.toString()
+        if (pkg == packageName) return
+        val winId = event.windowId
+        val source = event.source
+        val sourceViewId = runCatching { source?.viewIdResourceName }.getOrNull() ?: ""
+        val onExternal = runCatching {
+            val winDisp = source?.window?.displayId
+            when {
+                winDisp != null -> winDisp == extId || (app.injector.mirrorTargetDisplayZero && winDisp == 0)
+                else -> windowsOnAllDisplays.get(extId)?.any { it.id == winId } == true ||
+                    (app.injector.mirrorTargetDisplayZero &&
+                        windowsOnAllDisplays.get(0)?.any { it.id == winId } == true)
+            }
+        }.getOrDefault(false)
+        runCatching { source?.recycle() }
+        if (!onExternal) return
+
+        var pageDeltaY = 0f
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            val dy = event.scrollDeltaY
+            val dx = event.scrollDeltaX
+            if (dy == 0 && dx != 0) return
+            if (dy != 0) pageDeltaY = -dy.toFloat()
+        }
+        val curY = event.scrollY
+        val curFrom = event.fromIndex
+        val stateKey = "$winId:${event.className ?: ""}:$sourceViewId"
+        if (pageDeltaY == 0f) {
+            val prev = lastScrollStateByWindow[stateKey]
+            if (prev != null) {
+                val (prevY, prevFrom) = prev
+                if (curY >= 0 && prevY >= 0 && curY != prevY) {
+                    pageDeltaY = (prevY - curY).toFloat()
+                } else if (curFrom >= 0 && prevFrom >= 0 && curFrom != prevFrom) {
+                    pageDeltaY = (prevFrom - curFrom) * 40f
+                }
+            }
+        }
+        if (curY >= 0 || curFrom >= 0) {
+            if (lastScrollStateByWindow.size > 64) lastScrollStateByWindow.clear()
+            lastScrollStateByWindow[stateKey] = curY to curFrom
+        }
+        if (pageDeltaY != 0f) {
+            app.injector.notifyPageScroll(pageDeltaY)
+        }
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
         val type = event.eventType
@@ -318,6 +370,10 @@ class PortalPadAccessibilityService : AccessibilityService() {
                 Log.i(TAG, "DIAG systemui click vid=$cvid → fullscreen-convert check")
                 runCatching { PortalPadForegroundService.instance?.requestFullscreenConvertCheck() }
             }
+        }
+        if (type == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            handleViewScrolledForDock(event)
+            return
         }
         // Open on a real field CLICK or FOCUS. CLICKED alone missed fields that only
         // FOCUS on the first tap — WebView inputs (e.g. google.com's search box) and

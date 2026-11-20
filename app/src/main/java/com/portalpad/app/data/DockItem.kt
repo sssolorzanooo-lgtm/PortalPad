@@ -157,6 +157,9 @@ data class DockConfig(
     /** Color (ARGB Long) of the detection-zone highlight shown while tuning the
      *  zone on the dock customization page. Default = translucent accent yellow. */
     val zoneHighlightColor: Long = 0x66FFC83A,
+    /** Hide dock automatically when scrolling down inside apps or on wallpaper,
+     *  and restore it when scrolling back up. Default ON. */
+    val hideOnScroll: Boolean = true,
 ) {
     fun addShortcut(shortcut: DockItem.Shortcut) = copy(items = items + shortcut)
 

@@ -6319,11 +6319,10 @@ private fun ExternalMouseControls() {
         .collectAsState(initial = app.btMouse.running)
     var mouseOn by remember { mutableStateOf(storedMouseOn) }
     LaunchedEffect(storedMouseOn) { mouseOn = storedMouseOn }
-    // Live, not a snapshot. The background re-arm poller can arm the mouse many
-    // seconds after the display connects (a sleeping Bluetooth mouse takes that
-    // long to wake and enumerate), and the old local copy never saw it — the page
-    // sat on stale text until you pressed something, which made Reconnect look
-    // like the fix for a problem that had already resolved itself.
+    val storedAutoCapture by app.prefs.bool(keys.EXT_MOUSE_AUTO_CAPTURE, true)
+        .collectAsState(initial = true)
+    var autoCapture by remember { mutableStateOf(storedAutoCapture) }
+    LaunchedEffect(storedAutoCapture) { autoCapture = storedAutoCapture }
     val status by app.btMouse.lastStatusFlow.collectAsState()
     val searching by app.btMouse.searchingFlow.collectAsState()
     val armed by app.btMouse.runningFlow.collectAsState()
@@ -6403,7 +6402,7 @@ private fun ExternalMouseControls() {
     } else {
         ""
     }
-    val isConnected = mouseOn && status.startsWith("OK")
+    val isConnected = (mouseOn || autoCapture) && status.startsWith("OK")
 
     // ── Enable | Input mode, two columns ────────────────────────────────
     // The status used to hang under "Enable" as a subtitle, which forced this
@@ -6420,13 +6419,11 @@ private fun ExternalMouseControls() {
             Switch(
                 checked = mouseOn,
                 onCheckedChange = { on ->
-                    // Repaint before the write lands (SH: the toggle lagged the
-                    // tap); the stored flow reconciles, so background arming
-                    // still shows up too, not just our own calls.
                     mouseOn = on
                     scope.launch { app.prefs.setBool(keys.EXT_MOUSE_ENABLED, on) }
-                    if (on) app.btMouse.enable(true) else app.btMouse.disable()
+                    if (on) app.btMouse.enable(true) else app.btMouse.disable(explicit = true)
                 },
+                modifier = Modifier.testTag("ext_mouse_enable_switch"),
             )
         }
         Spacer(Modifier.width(12.dp))
@@ -6510,23 +6507,9 @@ private fun ExternalMouseControls() {
     // separates "what is happening" from the controls that choose it. Green when
     // grabbed, muted otherwise, so state reads at a glance.
     val statusText = when {
-        !mouseOn -> "Off"
-        // No display: say so regardless of what the last status string was.
-        // "no-display" only covers the unplug-while-captured path; a fresh app
-        // start leaves "idle", and unplugging while the re-arm poller was still
-        // hunting leaves a stale "ERR no-mouse-found" (the controller's
-        // onExternalDisplayGone returns early when nothing was captured). One
-        // display check catches every shape of the same situation.
+        !mouseOn && !autoCapture -> "Off"
         hasDisplay == null -> "Waiting for external display"
-        // Set when the display went away and the capture was released. Says why
-        // nothing is happening instead of leaving a stale "Connected" on screen —
-        // and the settings stay editable, since you may well want to pick a device
-        // and mode before plugging the display in.
         status == "no-display" -> "Waiting for external display"
-        // The re-arm poller is retrying. Worth saying out loud, because the usual
-        // cause is a sleeping Bluetooth mouse that only enumerates once it wakes —
-        // the logs showed 13-17 second gaps that resolved the instant the mouse
-        // was moved. Without this the page looks broken while it is working.
         searching -> "Searching for mouse\u2026 move it to wake it"
         status.startsWith("OK") -> {
             val who = if (connectedName.isBlank()) "" else " \u2014 $connectedName"
@@ -6537,6 +6520,7 @@ private fun ExternalMouseControls() {
                     status.substringAfter("grab=", "").trim() + ")"
             }
         }
+        !mouseOn && autoCapture -> "Auto-capture ready (connect a mouse)"
         else -> status
     }
     val strip = if (isConnected) AbAccent.copy(alpha = 0.14f) else AbSurfaceElevated
@@ -6571,7 +6555,7 @@ private fun ExternalMouseControls() {
     // as one unit. It is the only pure action on the page, so it is the only
     // thing that goes inactive - and the label says which of the two reasons
     // applies rather than leaving a dimmed button with no explanation.
-    val canReconnect = mouseOn && hasDisplay != null
+    val canReconnect = (mouseOn || autoCapture) && hasDisplay != null
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
         androidx.compose.material3.TextButton(
             onClick = { if (canReconnect) app.btMouse.enable(true) },
@@ -6579,12 +6563,44 @@ private fun ExternalMouseControls() {
         ) {
             Text(
                 when {
-                    !mouseOn -> "Reconnect (enable first)"
+                    !mouseOn && !autoCapture -> "Reconnect (enable first)"
                     hasDisplay == null -> "Reconnect (needs external display)"
                     else -> "Reconnect"
                 }
             )
         }
+    }
+
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(
+                "Auto-capture connected mice",
+                color = AbOnSurface,
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            Text(
+                "Automatically capture USB and Bluetooth mice into PortalPad's cursor so clicks register and the black pointer does not overlap. Default: On",
+                color = AbOnSurfaceMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        Switch(
+            checked = autoCapture,
+            onCheckedChange = { on ->
+                autoCapture = on
+                scope.launch { app.prefs.setBool(keys.EXT_MOUSE_AUTO_CAPTURE, on) }
+            },
+            colors = SwitchDefaults.colors(
+                checkedTrackColor = AbPrimary,
+                checkedThumbColor = AbPrimaryBright,
+                uncheckedTrackColor = AbSurfaceElevated,
+                uncheckedThumbColor = AbOnSurfaceDim,
+            ),
+            modifier = Modifier.testTag("ext_mouse_auto_capture_switch"),
+        )
     }
 
     // Mode description, directly under the status strip. It explains the dropdown
@@ -9295,6 +9311,41 @@ private fun DockCustomizationPage(onBack: () -> Unit) {
                     key = PreferencesRepository.Keys.ALWAYS_SHOW_DOCK_ON_WALLPAPER,
                     default = true,
                 )
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text(
+                            "Hide dock while scrolling",
+                            color = AbOnSurface,
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                        Text(
+                            "Hide the dock when scrolling down inside an app or on the wallpaper screen, and bring it back when scrolling up.",
+                            color = AbOnSurfaceMuted,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        Text(
+                            leadInBold("Default: On"),
+                            color = AbOnSurfaceDim,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Switch(
+                        checked = dockCfg.hideOnScroll,
+                        onCheckedChange = { enabled ->
+                            scope.launch { prefs.setDockConfig(dockCfg.copy(hideOnScroll = enabled)) }
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedTrackColor = AbPrimary,
+                            checkedThumbColor = AbPrimaryBright,
+                            uncheckedTrackColor = AbSurfaceElevated,
+                            uncheckedThumbColor = AbOnSurfaceDim,
+                        ),
+                        modifier = Modifier.testTag("dock_hide_on_scroll_switch"),
+                    )
+                }
             }
             SectionCard(title = "Reveal zone") {
                 Text(

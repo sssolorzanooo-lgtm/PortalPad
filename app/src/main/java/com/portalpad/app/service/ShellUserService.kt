@@ -3030,21 +3030,12 @@ class ShellUserService : IShellService.Stub {
      *       REL (0002): REL_X  REL_Y  REL_WHEEL  REL_WHEEL_HI_RES
      */
     /** A pointer device: its node, and the name a human would recognise. */
-    private data class PointerDev(val path: String, val name: String)
+    private data class PointerDev(
+        val path: String,
+        val name: String,
+        val hasMouseButtons: Boolean = false,
+    )
 
-    /**
-     * Every pointer device, plus a count of the input devices that are NOT
-     * pointers.
-     *
-     * ONE definition of "pointer" — REL_X and REL_Y — shared by the picker and
-     * by capture. That filter is a safety boundary, not a convenience: /dev/input
-     * also carries the touchscreen and the power and volume keys, and EVIOCGRAB
-     * on a touchscreen takes exclusive access to it and leaves the phone
-     * unresponsive to touch. A touchscreen reports ABS, never REL, so requiring
-     * REL excludes it by construction. Widening this to "also allow ABS" would
-     * make a true multi-touch trackpad selectable and the touchscreen selectable
-     * in the same stroke.
-     */
     private fun listPointers(): Pair<List<PointerDev>, Int> {
         val out = runCatching {
             val p = ProcessBuilder("getevent", "-pl")
@@ -3061,11 +3052,16 @@ class ShellUserService : IShellService.Stub {
         var curName = ""
         var curHasRelX = false
         var curHasRelY = false
+        var curHasMouseBtn = false
 
         fun finish() {
             val path = curPath ?: return
             if (curHasRelX && curHasRelY) {
-                found += PointerDev(path, curName.ifBlank { path.substringAfterLast('/') })
+                found += PointerDev(
+                    path,
+                    curName.ifBlank { path.substringAfterLast('/') },
+                    hasMouseButtons = curHasMouseBtn,
+                )
             } else {
                 others++
             }
@@ -3080,18 +3076,23 @@ class ShellUserService : IShellService.Stub {
                 curName = ""
                 curHasRelX = false
                 curHasRelY = false
+                curHasMouseBtn = false
                 continue
             }
             if (curPath == null) continue
             // name:     "Logitech M720"
             Regex("^name:\\s*\"(.*)\"$").find(line)?.let { curName = it.groupValues[1] }
+            if (line.startsWith("KEY")) {
+                if (line.contains("BTN_MOUSE") || line.contains("BTN_LEFT")) curHasMouseBtn = true
+            }
             if (line.startsWith("REL")) {
                 if (line.contains("REL_X")) curHasRelX = true
                 if (line.contains("REL_Y")) curHasRelY = true
             }
         }
         finish()
-        return Pair(found, others)
+        val sorted = found.sortedByDescending { it.hasMouseButtons }
+        return Pair(sorted, others)
     }
 
     override fun listPointerDevices(): String {

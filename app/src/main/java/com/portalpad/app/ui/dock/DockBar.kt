@@ -274,6 +274,8 @@ fun DockBar(
     // Track last interaction time for auto-hide
     var lastInteraction by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var visible by remember { mutableStateOf(true) }
+    val scrollTracker = remember { DockScrollHideTracker() }
+    var scrollHidden by remember { mutableStateOf(false) }
 
     // Live "cursor is currently parked over the visible dock band" flag. The
     // idle-hide loop reads this each tick (movement-independent, mirroring the
@@ -308,11 +310,53 @@ fun DockBar(
     // Reset timer on any config change (e.g. new item added) so the user can see
     // it — UNLESS the top-bar customization page is suppressing the dock, in which
     // case forcing it visible would make it pop up over the top-bar preview.
-    LaunchedEffect(config) {
+    LaunchedEffect(config.items, config.position) {
         if (topBarPreviewing) return@LaunchedEffect
         lastInteraction = System.currentTimeMillis()
+        scrollTracker.reveal()
+        scrollHidden = false
         visible = true
     }
+
+    LaunchedEffect(wallpaperShowing) {
+        if (wallpaperShowing) {
+            scrollTracker.reveal()
+            scrollHidden = false
+        }
+    }
+
+    val quickSettingsOpenNow by com.portalpad.app.PortalPadApp.instance
+        .quickSettingsOpen.collectAsState()
+    LaunchedEffect(config.hideOnScroll, topBarPreviewing, dockCustomizing) {
+        if (!config.hideOnScroll || dockCustomizing) {
+            scrollTracker.reset()
+            scrollHidden = false
+            return@LaunchedEffect
+        }
+        app.injector.dockScrollSignal.collect { pageDeltaY ->
+            if (topBarPreviewing || dockCustomizing || reorderMode || removeMode ||
+                com.portalpad.app.PortalPadApp.instance.quickSettingsOpen.value
+            ) {
+                return@collect
+            }
+            val nowHidden = scrollTracker.onPageScroll(pageDeltaY, config.hideOnScroll)
+            scrollHidden = nowHidden
+            if (!nowHidden) {
+                lastInteraction = System.currentTimeMillis()
+                if (config.autoHideAfterSec > 0) visible = true
+            }
+        }
+    }
+
+    val dockDisplayed = DockScrollHideTracker.shouldShowDock(
+        baseVisible = visible,
+        scrollHidden = scrollHidden,
+        hideOnScrollEnabled = config.hideOnScroll,
+        dockCustomizing = dockCustomizing,
+        reorderMode = reorderMode,
+        removeMode = removeMode,
+        quickSettingsOpen = quickSettingsOpenNow,
+    )
 
     // Auto-hide loop: every second, check if we've been idle past the threshold.
     // widgetOverlayOpen is a KEY so the effect re-evaluates on layer open/close —
@@ -371,8 +415,8 @@ fun DockBar(
     // it — otherwise the separate menu window lingers on screen after the dock
     // has slid out, which looks broken. (Full dock teardown is also covered in
     // DockOverlay.dismiss().)
-    LaunchedEffect(visible) {
-        if (!visible) {
+    LaunchedEffect(dockDisplayed) {
+        if (!dockDisplayed) {
             // Pixel's wallpaper-click guard uses this measured band to give
             // visible dock controls priority. Do not leave stale bounds behind
             // while the dock is auto-hidden; layout republishes them on reveal.
@@ -455,6 +499,7 @@ fun DockBar(
     // now user-configurable (mirroring the top bar's detection zone).
     val edgeThresholdPx = config.revealZoneHeightPx.coerceIn(2, 200)
     val triggerBandFraction = config.revealZoneWidthPct.coerceIn(10, 100) / 100f
+    var wasAtRevealEdge by remember { mutableStateOf(false) }
 
     LaunchedEffect(cursorPos, config.position, externalDisplayId, edgeThresholdPx, triggerBandFraction) {
         if (config.autoHideAfterSec <= 0) return@LaunchedEffect
@@ -479,7 +524,11 @@ fun DockBar(
             DockPosition.LEFT -> x <= edgeThresholdPx && inYBand
             DockPosition.RIGHT -> x >= metrics.widthPixels - edgeThresholdPx && inYBand
         }
-        if (atEdge) {
+        val enteredEdge = atEdge && !wasAtRevealEdge
+        wasAtRevealEdge = atEdge
+        if (enteredEdge || (atEdge && !visible)) {
+            scrollTracker.reveal()
+            scrollHidden = false
             visible = true
             lastInteraction = System.currentTimeMillis()
         }
@@ -644,8 +693,8 @@ fun DockBar(
     // Tell the injector when the cursor is over the VISIBLE dock band, so a
     // right-click is handled in-process (item menu) instead of being injected as
     // a launch tap. Reset to false when the dock isn't visible / on dispose.
-    LaunchedEffect(cursorOnDockBand, visible) {
-        val onVisibleBand = cursorOnDockBand && visible
+    LaunchedEffect(cursorOnDockBand, dockDisplayed) {
+        val onVisibleBand = cursorOnDockBand && dockDisplayed
         app.injector.cursorOverDock = onVisibleBand
         // AUTO-HIDE HOLD (live): publish band membership into a snapshot the idle
         // loop polls each tick, so a STATIONARY cursor holds the dock open. The
@@ -655,7 +704,7 @@ fun DockBar(
         // full auto-hide duration after the cursor finally leaves — matching the
         // Top Bar's hover-hold behavior.
         cursorOnBandState.value = onVisibleBand
-        if (visible) lastInteraction = System.currentTimeMillis()
+        if (dockDisplayed) lastInteraction = System.currentTimeMillis()
         // Z-ORDER: the instant the cursor enters the visible dock, lift the cursor
         // overlay back above the dock window (lightweight restack, no rebuild) so
         // it can never sit under the icons — independent of any startup dock/cursor
@@ -859,7 +908,7 @@ fun DockBar(
         outerModifier.onGloballyPositioned { rootHeightPx = it.size.height; rootWidthPx = it.size.width },
         contentAlignment = align,
     ) {
-        if (visible) {
+        if (dockDisplayed) {
             // The dock "container": for a horizontal dock it's taller than the
             // glass (glass on the bottom band, transparent headroom on top). The
             // glass visuals (gradient + border + shadow + shape) are drawn by a

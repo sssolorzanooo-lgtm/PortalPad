@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.encodeToString
@@ -288,6 +289,9 @@ class PreferencesRepository(private val context: Context) {
         // User opted into the external mouse (persisted). Drives auto-resume:
         // re-arm capture on display/Bluetooth connect without re-toggling.
         val EXT_MOUSE_ENABLED = booleanPreferencesKey("ext_mouse_enabled")
+        // Automatically capture connected USB/Bluetooth mice into PortalPad's
+        // cursor when an external display session is active. Default ON.
+        val EXT_MOUSE_AUTO_CAPTURE = booleanPreferencesKey("ext_mouse_auto_capture")
         // Per-device mode-toggle button map: "deviceName<TAB>linuxCode" lines,
         // one per device. Pressing the mapped button while that device is
         // captured flips input mode mouse<->remote (BluetoothMouseController).
@@ -746,7 +750,7 @@ class PreferencesRepository(private val context: Context) {
         p[Keys.DOCK_CONFIG]?.let {
             runCatching { json.decodeFromString<DockConfig>(it) }.getOrNull()
         } ?: DockConfig()
-    }
+    }.distinctUntilChanged()
     val topBarConfig: Flow<TopBarConfig> = context.dataStore.data.map { p ->
         p[Keys.TOP_BAR_CONFIG]?.let {
             runCatching { json.decodeFromString<TopBarConfig>(it) }.getOrNull()
@@ -824,6 +828,9 @@ class PreferencesRepository(private val context: Context) {
     }
     val forceSeparateDisplay: Flow<Boolean> = context.dataStore.data.map {
         it[Keys.FORCE_SEPARATE_DISPLAY] ?: false
+    }
+    val extMouseAutoCapture: Flow<Boolean> = context.dataStore.data.map {
+        it[Keys.EXT_MOUSE_AUTO_CAPTURE] ?: true
     }
     val readerFlipMethod: Flow<Int> = context.dataStore.data.map { it[Keys.READER_FLIP_METHOD] ?: 1 }
     val remoteInputMode: Flow<Int> = context.dataStore.data.map { it[Keys.REMOTE_INPUT_MODE] ?: 0 }

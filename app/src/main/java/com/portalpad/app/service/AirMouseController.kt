@@ -204,6 +204,7 @@ class AirMouseController(
             val accelMax = 2.0f
             val sp = kotlin.math.hypot(outX.toDouble(), outY.toDouble()).toFloat()
             val gain = (1f + accel * sp).coerceIn(1f, accelMax)
+            injector.notifyTouchpadOrAirMouseActive()
             injector.pointerMove(outX * gain, outY * gain)
         }
         // NOTE: last* is advanced per-axis in the deadzone block above (only

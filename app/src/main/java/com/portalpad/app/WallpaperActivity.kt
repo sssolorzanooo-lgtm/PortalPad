@@ -1,10 +1,13 @@
 package com.portalpad.app
 
 import android.os.Bundle
+import android.view.InputDevice
+import android.view.MotionEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.getValue
@@ -12,6 +15,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.res.painterResource
@@ -108,7 +112,18 @@ class WallpaperActivity : ComponentActivity() {
             androidx.compose.runtime.LaunchedEffect(Unit) {
                 repeat(4) { kotlinx.coroutines.delay(200); repaintKick.value++ }
             }
-            Box(Modifier.fillMaxSize().background(Color.Black)) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black)
+                    .pointerInput(Unit) {
+                        detectVerticalDragGestures { _, dragAmount ->
+                            if (dragAmount != 0f) {
+                                app.injector.notifyPageScroll(dragAmount)
+                            }
+                        }
+                    },
+            ) {
                 androidx.compose.runtime.key(repaintKick.value) {
                     val res = wallpaper.drawableRes
                     when {
@@ -138,6 +153,50 @@ class WallpaperActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        val app = applicationContext as? PortalPadApp
+        if (app != null &&
+            (ev.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE
+        ) {
+            if (ev.actionMasked == MotionEvent.ACTION_SCROLL) {
+                val v = ev.getAxisValue(MotionEvent.AXIS_VSCROLL)
+                if (v != 0f && !app.injector.isLikelyOwnInjectedScroll()) {
+                    app.injector.notifyPageScroll(v * 40f)
+                }
+            }
+            if (!app.btMouse.isActivelyGrabbed) {
+                val dev = InputDevice.getDevice(ev.deviceId)
+                val isRealExternal = dev != null && !dev.isVirtual
+                if (isRealExternal) {
+                    when (ev.actionMasked) {
+                        MotionEvent.ACTION_HOVER_MOVE,
+                        MotionEvent.ACTION_MOVE,
+                        -> {
+                            if (!app.injector.isLikelyOwnInjectedHover(ev.x, ev.y)) {
+                                app.injector.notifyExternalMouseMoving()
+                                app.injector.syncExternalCursorPositionQuietly(ev.x, ev.y)
+                            }
+                        }
+                        MotionEvent.ACTION_BUTTON_PRESS -> {
+                            app.injector.syncExternalCursorPositionQuietly(ev.x, ev.y)
+                            when (ev.actionButton) {
+                                MotionEvent.BUTTON_PRIMARY -> {
+                                    app.injector.leftClick()
+                                    return true
+                                }
+                                MotionEvent.BUTTON_SECONDARY -> {
+                                    app.injector.rightClick()
+                                    return true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return super.dispatchGenericMotionEvent(ev)
     }
 
     override fun onResume() {

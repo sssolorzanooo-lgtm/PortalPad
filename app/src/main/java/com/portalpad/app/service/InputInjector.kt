@@ -1175,17 +1175,87 @@ class InputInjector(
         }
     }
 
+    private val _baseCursorVisible = MutableStateFlow(true)
+    private val _externalMouseHidingCursor = MutableStateFlow(false)
     private val _cursorVisible = MutableStateFlow(true)
+    private val cursorVisibilityHandler =
+        android.os.Handler(android.os.Looper.getMainLooper())
+    private val restoreCursorAfterExternalMouse = Runnable {
+        if (_externalMouseHidingCursor.value) {
+            _externalMouseHidingCursor.value = false
+            updateEffectiveCursorVisibility()
+        }
+    }
+
+    private fun updateEffectiveCursorVisibility() {
+        _cursorVisible.value = _baseCursorVisible.value && !_externalMouseHidingCursor.value
+    }
 
     /**
      * Whether the cursor overlay should currently render. Controlled by:
      *  - The CursorOverlay observes this and short-circuits onDraw when false
      *  - TrackpadActivity sets this based on (mode == Media || hideInAppPref)
      *  - Service can also force it false if no display is attached
+     *  - Dynamic external-mouse suppression when an un-grabbed physical mouse
+     *    drives Android's black pointer.
      */
     val cursorVisible: StateFlow<Boolean> = _cursorVisible.asStateFlow()
 
-    fun setCursorVisible(visible: Boolean) { _cursorVisible.value = visible }
+    fun setCursorVisible(visible: Boolean) {
+        _baseCursorVisible.value = visible
+        updateEffectiveCursorVisibility()
+    }
+
+    /**
+     * Hide PortalPad's white cursor while an un-grabbed external mouse is
+     * actively moving, and automatically restore it once motion pauses or
+     * Touchpad/Air Mouse input resumes.
+     */
+    fun notifyExternalMouseMoving(idleRestoreMs: Long = EXTERNAL_MOUSE_IDLE_RESTORE_MS) {
+        cursorVisibilityHandler.removeCallbacks(restoreCursorAfterExternalMouse)
+        if (!_externalMouseHidingCursor.value) {
+            _externalMouseHidingCursor.value = true
+            updateEffectiveCursorVisibility()
+        }
+        cursorVisibilityHandler.postDelayed(
+            restoreCursorAfterExternalMouse,
+            idleRestoreMs.coerceAtLeast(150L),
+        )
+    }
+
+    /** Restore PortalPad's white cursor when Touchpad or Air Mouse resumes. */
+    fun notifyTouchpadOrAirMouseActive() {
+        cursorVisibilityHandler.removeCallbacks(restoreCursorAfterExternalMouse)
+        if (_externalMouseHidingCursor.value) {
+            _externalMouseHidingCursor.value = false
+            updateEffectiveCursorVisibility()
+        }
+    }
+
+    /**
+     * Update PortalPad's cursor coordinates to match an observed un-grabbed
+     * external mouse position without emitting synthetic HOVER_MOVE back.
+     */
+    fun syncExternalCursorPositionQuietly(x: Float, y: Float) {
+        cursorX = x.coerceIn(0f, (displayWidth - 1).coerceAtLeast(0).toFloat())
+        cursorY = y.coerceIn(0f, (displayHeight - 1).coerceAtLeast(0).toFloat())
+    }
+
+    /**
+     * Directional page scroll signal for scroll-to-hide dock.
+     * Negative = page scrolling down (hide dock); Positive = page scrolling up (show dock).
+     */
+    private val _dockScrollSignal = MutableSharedFlow<Float>(
+        replay = 0,
+        extraBufferCapacity = 32,
+    )
+    val dockScrollSignal: SharedFlow<Float> = _dockScrollSignal.asSharedFlow()
+
+    fun notifyPageScroll(pageDeltaY: Float) {
+        if (pageDeltaY != 0f && !pageDeltaY.isNaN()) {
+            _dockScrollSignal.tryEmit(pageDeltaY)
+        }
+    }
 
     /**
      * Emits the cursor coordinate on each committed left click. Desktop-mode
@@ -2207,9 +2277,24 @@ class InputInjector(
      *   true  — hover events fire normally (default for production)
      *   false — hover injection entirely disabled at compile time
      */
-    private val EMIT_HOVER = true
+        private val EMIT_HOVER = true
 
     @Volatile private var activeHoverDisplayId: Int = -1
+    @Volatile private var lastInjectedHoverAtMs: Long = 0L
+    @Volatile private var lastInjectedHoverX: Float = -1f
+    @Volatile private var lastInjectedHoverY: Float = -1f
+    @Volatile private var lastInjectedScrollAtMs: Long = 0L
+
+    fun isLikelyOwnInjectedHover(x: Float, y: Float, windowMs: Long = 160L): Boolean {
+        val dt = SystemClock.uptimeMillis() - lastInjectedHoverAtMs
+        if (dt !in 0..windowMs) return false
+        return kotlin.math.hypot((x - lastInjectedHoverX).toDouble(), (y - lastInjectedHoverY).toDouble()) <= 8.0
+    }
+
+    fun isLikelyOwnInjectedScroll(windowMs: Long = 160L): Boolean {
+        val dt = SystemClock.uptimeMillis() - lastInjectedScrollAtMs
+        return dt in 0..windowMs
+    }
 
     private fun sendHoverViaBackend(x: Float, y: Float) {
         if (hoverPausedForTouch) return
@@ -2252,6 +2337,9 @@ class InputInjector(
                     Log.d(TAG, "hover ENTER disp=$tDisp pos=(${tx.toInt()},${ty.toInt()})")
                 }
                 // 8194 = SOURCE_MOUSE | CLASS_POINTER, action 7 = HOVER_MOVE
+                lastInjectedHoverAtMs = SystemClock.uptimeMillis()
+                lastInjectedHoverX = tx
+                lastInjectedHoverY = ty
                 backend.backend.pointer(
                     action = MotionEvent.ACTION_HOVER_MOVE,
                     x = tx, y = ty, displayId = tDisp,
@@ -2681,27 +2769,22 @@ class InputInjector(
         lastScrollAt = now
         scrollAccumX += dx * mult
         scrollAccumY += dy * mult
-        val cx = cursorX.toInt(); val cy = cursorY.toInt()
-        val endX = (cx - scrollAccumX * 2).toInt().coerceIn(0, displayWidth - 1)
-        val endY = (cy - scrollAccumY * 2).toInt().coerceIn(0, displayHeight - 1)
-        // GUARD: a swipe whose start and end are nearly the same point is
-        // interpreted by Android as a TAP/CLICK, not a scroll — and a SHORT
-        // swipe dispatched via the a11y path is short enough that some apps
-        // (e.g. Chrome) still register it as a tap on whatever's under the
-        // cursor. So we require a larger minimum travel before injecting: below
-        // it we keep accumulating (slow scrolls aren't lost), and once we cross
-        // it the injected gesture is unambiguously a swipe. This is what stops a
-        // near-stationary edge-strip hold from landing as a click.
-        val travel = kotlin.math.hypot((endX - cx).toDouble(), (endY - cy).toDouble())
-        if (travel < 24.0) {
-            return@safe
-        }
+        val plan = computeScrollSwipePlan(
+            cursorX = cursorX,
+            cursorY = cursorY,
+            rawDeltaX = -scrollAccumX * 2f,
+            rawDeltaY = -scrollAccumY * 2f,
+            displayWidth = displayWidth,
+            displayHeight = displayHeight,
+            minTravel = 24.0,
+        ) ?: return@safe
         // The accumulated motion is being delivered as this swipe — clear it.
         scrollAccumX = 0f
         scrollAccumY = 0f
+        if (plan.pageScrollDeltaY != 0f) notifyPageScroll(plan.pageScrollDeltaY)
         if (useA11y("scroll")) {
-            val (tDisp, tsx, tsy) = resolveTargetDisplayAndCoords(cx.toFloat(), cy.toFloat())
-            val (_, tex, tey) = resolveTargetDisplayAndCoords(endX.toFloat(), endY.toFloat())
+            val (tDisp, tsx, tsy) = resolveTargetDisplayAndCoords(plan.startX, plan.startY)
+            val (_, tex, tey) = resolveTargetDisplayAndCoords(plan.endX, plan.endY)
             // Feed the swipe vector to the paced/coalesced a11y scroller — one
             // gesture in flight at a time, so swipes don't cancel each other.
             PortalPadAccessibilityService.instance?.scrollGesture(
@@ -2711,8 +2794,8 @@ class InputInjector(
             )
             return@safe
         }
-        val (tDisp, tsx, tsy) = resolveTargetDisplayAndCoords(cx.toFloat(), cy.toFloat())
-        val (_, tex, tey) = resolveTargetDisplayAndCoords(endX.toFloat(), endY.toFloat())
+        val (tDisp, tsx, tsy) = resolveTargetDisplayAndCoords(plan.startX, plan.startY)
+        val (_, tex, tey) = resolveTargetDisplayAndCoords(plan.endX, plan.endY)
         val backend = PortalPadApp.instance.clickBackend
 
         when (backend) {
@@ -2737,8 +2820,10 @@ class InputInjector(
      * fling/momentum, unlike [scrollPixels]'s swipe. [vNotches] +1 = up.
      */
     fun wheelScroll(vNotches: Float) = safe {
+        if (vNotches != 0f) notifyPageScroll(vNotches * 40f)
         val be = PortalPadApp.instance.activeBoundBackend ?: return@safe
         if (!be.isReady) return@safe
+        lastInjectedScrollAtMs = SystemClock.uptimeMillis()
         val (tDisp, tx, ty) = resolveTargetDisplayAndCoords(cursorX, cursorY)
         be.injectScroll(tx, ty, vNotches, 0f, tDisp)
     }
@@ -2760,13 +2845,18 @@ class InputInjector(
      * content UP (toward the top) — matching a standard mouse wheel-up.
      */
     fun scrollPixels(dx: Float, dy: Float) = safe {
-        val cx = cursorX.toInt(); val cy = cursorY.toInt()
-        val endX = (cx + dx).toInt().coerceIn(0, displayWidth - 1)
-        val endY = (cy + dy).toInt().coerceIn(0, displayHeight - 1)
-        val travel = kotlin.math.hypot((endX - cx).toDouble(), (endY - cy).toDouble())
-        if (travel < 8.0) return@safe
-        val (tDisp, tsx, tsy) = resolveTargetDisplayAndCoords(cx.toFloat(), cy.toFloat())
-        val (_, tex, tey) = resolveTargetDisplayAndCoords(endX.toFloat(), endY.toFloat())
+        val plan = computeScrollSwipePlan(
+            cursorX = cursorX,
+            cursorY = cursorY,
+            rawDeltaX = dx,
+            rawDeltaY = dy,
+            displayWidth = displayWidth,
+            displayHeight = displayHeight,
+            minTravel = 8.0,
+        ) ?: return@safe
+        if (plan.pageScrollDeltaY != 0f) notifyPageScroll(plan.pageScrollDeltaY)
+        val (tDisp, tsx, tsy) = resolveTargetDisplayAndCoords(plan.startX, plan.startY)
+        val (_, tex, tey) = resolveTargetDisplayAndCoords(plan.endX, plan.endY)
         when (val backend = PortalPadApp.instance.clickBackend) {
             is ClickBackend.ShizukuUserService -> {
                 if (!backend.backend.isReady) return@safe
@@ -2830,11 +2920,13 @@ class InputInjector(
     }
 
     fun remoteScrollDown(strength: Float = 1f) {
+        notifyPageScroll(-40f * strength.coerceIn(0.65f, 1.15f))
         val scale = remoteScrollScale(strength)
         remoteSwipe(0f, -displayHeight / 8f * scale, remoteScrollDuration(strength))
     }
 
     fun remoteScrollUp(strength: Float = 1f) {
+        notifyPageScroll(40f * strength.coerceIn(0.65f, 1.15f))
         val scale = remoteScrollScale(strength)
         remoteSwipe(0f, displayHeight / 8f * scale, remoteScrollDuration(strength))
     }
@@ -2857,6 +2949,7 @@ class InputInjector(
      * 0.32/70ms cadence without creating an asynchronous swipe backlog.
      */
     private fun remoteHeldScroll(vNotches: Float, hNotches: Float) = safe {
+        if (vNotches != 0f) notifyPageScroll(vNotches * 40f)
         val backend = PortalPadApp.instance.activeBoundBackend
         if (backend != null && backend.isReady) {
             val (tDisp, tx, ty) = resolveTargetDisplayAndCoords(
@@ -3015,6 +3108,7 @@ class InputInjector(
             }
             remoteTouchDragX = nextX
             remoteTouchDragY = nextY
+            if (dyFraction != 0f) notifyPageScroll(dyFraction * height)
             backend.pointer(
                 action = MotionEvent.ACTION_MOVE,
                 x = nextX,
@@ -3076,6 +3170,7 @@ class InputInjector(
         vertical: Int,
         strength: Float,
     ) = safe {
+        if (vertical != 0) notifyPageScroll(vertical * 40f)
         val appBounds = PortalPadAccessibilityService.instance
             ?.let { runCatching { it.foregroundAppWindowBounds(displayId) }.getOrNull() }
         val left = appBounds?.left?.toFloat() ?: 0f
@@ -3963,6 +4058,45 @@ class InputInjector(
         /** Reference finger span (px) for scale=1.0 in the injected pinch; the
          *  live span is PINCH_BASE_SPAN * pinchScale. */
         private const val PINCH_BASE_SPAN = 240f
+        private const val EXTERNAL_MOUSE_IDLE_RESTORE_MS = 1200L
+
+        internal data class ScrollSwipePlan(
+            val startX: Float,
+            val startY: Float,
+            val endX: Float,
+            val endY: Float,
+            val pageScrollDeltaY: Float,
+        )
+
+        internal fun computeScrollSwipePlan(
+            cursorX: Float,
+            cursorY: Float,
+            rawDeltaX: Float,
+            rawDeltaY: Float,
+            displayWidth: Int,
+            displayHeight: Int,
+            minTravel: Double,
+        ): ScrollSwipePlan? {
+            val rawTravel = kotlin.math.hypot(rawDeltaX.toDouble(), rawDeltaY.toDouble())
+            if (rawTravel < minTravel) return null
+            val maxX = (displayWidth - 1).coerceAtLeast(1).toFloat()
+            val maxY = (displayHeight - 1).coerceAtLeast(1).toFloat()
+            val cx = cursorX.coerceIn(0f, maxX)
+            val cy = cursorY.coerceIn(0f, maxY)
+            val desiredEndX = cx + rawDeltaX
+            val desiredEndY = cy + rawDeltaY
+            val endX = desiredEndX.coerceIn(0f, maxX)
+            val endY = desiredEndY.coerceIn(0f, maxY)
+            val startX = if (desiredEndX != endX) (endX - rawDeltaX).coerceIn(0f, maxX) else cx
+            val startY = if (desiredEndY != endY) (endY - rawDeltaY).coerceIn(0f, maxY) else cy
+            return ScrollSwipePlan(
+                startX = startX,
+                startY = startY,
+                endX = endX,
+                endY = endY,
+                pageScrollDeltaY = rawDeltaY,
+            )
+        }
 
         internal fun scaleCoordsForMirror(
             x: Float,

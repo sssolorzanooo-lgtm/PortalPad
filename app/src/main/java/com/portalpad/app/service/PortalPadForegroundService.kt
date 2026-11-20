@@ -122,6 +122,23 @@ class PortalPadForegroundService : Service() {
     /** Pending one-shot cursor re-assert (see [scheduleOverlayReassert]). */
     private var pendingOverlayReassert: Runnable? = null
     private val displayManager by lazy { getSystemService(Context.DISPLAY_SERVICE) as DisplayManager }
+    private val inputManager by lazy { getSystemService(Context.INPUT_SERVICE) as android.hardware.input.InputManager }
+    private val inputDeviceListener = object : android.hardware.input.InputManager.InputDeviceListener {
+        override fun onInputDeviceAdded(deviceId: Int) {
+            val dev = android.view.InputDevice.getDevice(deviceId)
+            if (BluetoothMouseController.isExternalPointerDevice(dev)) {
+                Log.i(TAG, "USB/BT pointer device added: id=$deviceId name=${dev?.name}")
+                (applicationContext as? PortalPadApp)?.btMouse?.onPointerHardwareAttached()
+            }
+        }
+        override fun onInputDeviceRemoved(deviceId: Int) {}
+        override fun onInputDeviceChanged(deviceId: Int) {
+            val dev = android.view.InputDevice.getDevice(deviceId)
+            if (BluetoothMouseController.isExternalPointerDevice(dev)) {
+                (applicationContext as? PortalPadApp)?.btMouse?.onPointerHardwareAttached()
+            }
+        }
+    }
     private val bubble by lazy { FloatingBubbleManager(this) }
     private val virtualDisplaySession: com.portalpad.app.service.AirGlassesSession
         get() = (applicationContext as PortalPadApp).airGlassesSession
@@ -1023,8 +1040,10 @@ class PortalPadForegroundService : Service() {
         }
         (applicationContext as PortalPadApp).setServiceRunning(true)
         displayManager.registerDisplayListener(displayListener, null)
+        runCatching { inputManager.registerInputDeviceListener(inputDeviceListener, mainHandler) }
         displayManager.displays.forEach { logDisplayDiag(it.displayId, "baseline") }
         refreshExternalDisplay(autoLaunchOnFirstAttach = false, trigger = "onCreate")
+        (applicationContext as? PortalPadApp)?.btMouse?.maybeAutoArm(delayMs = 1000L)
         startBubbleWatcher()
         (applicationContext as PortalPadApp).signal.start()
         startAutoDisableWatcher()
@@ -1732,6 +1751,7 @@ class PortalPadForegroundService : Service() {
         runCatching { sessionWakeLock?.let { if (it.isHeld) it.release() } }
         sessionWakeLock = null
         runCatching { unregisterReceiver(screenStateReceiver) }
+        runCatching { inputManager.unregisterInputDeviceListener(inputDeviceListener) }
         // Release the external-mouse capture with the session (SH): with the
         // service stopped the mouse must belong to Android again - no cursor
         // driving, no mapped-button mode toggling (both kept working after
@@ -2884,9 +2904,11 @@ class PortalPadForegroundService : Service() {
         if (healthyOnVd) {
             Log.d(TAG, "$trigger: session already on live trusted VD (vd=${app.virtualDisplayId} " +
                 "ext=${app.externalDisplayId.value}) — skip redundant rebuild")
+            app.btMouse.maybeAutoArm(delayMs = 400L)
             return
         }
         refreshExternalDisplay(force = true, trigger = trigger)
+        app.btMouse.maybeAutoArm(delayMs = 800L)
     }
 
     private fun refreshExternalDisplay(

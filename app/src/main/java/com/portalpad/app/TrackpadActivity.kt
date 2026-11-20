@@ -1654,16 +1654,31 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
 
     val sink = remember {
         object : GestureSink {
-            override fun onMove(dx: Float, dy: Float) = injector.pointerMove(dx, dy)
-            override fun onTap() = injector.leftClick()
-            override fun onSecondaryTap() = injector.rightClick()
-            override fun onDoubleTap() = injector.doubleClick()
+            override fun onMove(dx: Float, dy: Float) {
+                injector.notifyTouchpadOrAirMouseActive()
+                injector.pointerMove(dx, dy)
+            }
+            override fun onTap() {
+                injector.notifyTouchpadOrAirMouseActive()
+                injector.leftClick()
+            }
+            override fun onSecondaryTap() {
+                injector.notifyTouchpadOrAirMouseActive()
+                injector.rightClick()
+            }
+            override fun onDoubleTap() {
+                injector.notifyTouchpadOrAirMouseActive()
+                injector.doubleClick()
+            }
             // Streaming hold: continuous seek while holding the keyboard's
             // ◀◀/▶▶ (no-op when the cursor is anywhere else).
             override fun onLongPressStart() = injector.kbSeekHoldStart()
             override fun onLongPressEnd() = injector.kbSeekHoldEnd()
             override fun onScroll(dx: Float, dy: Float) = injector.scroll(dx, dy)
-            override fun onDragStart(captionMove: Boolean) = injector.dragStart(captionMove)
+            override fun onDragStart(captionMove: Boolean) {
+                injector.notifyTouchpadOrAirMouseActive()
+                injector.dragStart(captionMove)
+            }
             override fun onDragMove(dx: Float, dy: Float) = injector.dragMove(dx, dy)
             override fun onDragEnd() = injector.dragEnd()
             override fun onPinch(scale: Float) = injector.pinchUpdate(scale)
@@ -1883,7 +1898,10 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                         ) {
                             if (edgeStripOnLeft) {
                                 com.portalpad.app.ui.trackpad.ScrollBar(
-                                    onScroll = { dx, dy -> injector.scroll(dx, dy) },
+                                    onScroll = { dx, dy ->
+                                        injector.notifyTouchpadOrAirMouseActive()
+                                        injector.scroll(dx, dy)
+                                    },
                                     modifier = Modifier
                                         .width(44.dp)
                                         .fillMaxHeight(),
@@ -1912,7 +1930,10 @@ private fun TrackpadScreen(injector: InputInjector, initialMode: String) {
                                     Modifier.width(8.dp),
                                 )
                                 com.portalpad.app.ui.trackpad.ScrollBar(
-                                    onScroll = { dx, dy -> injector.scroll(dx, dy) },
+                                    onScroll = { dx, dy ->
+                                        injector.notifyTouchpadOrAirMouseActive()
+                                        injector.scroll(dx, dy)
+                                    },
                                     modifier = Modifier
                                         .width(44.dp)
                                         .fillMaxHeight(),
